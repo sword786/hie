@@ -1,239 +1,287 @@
 /**
- * LabControl Pro - WebSocket Relay Server v2.0
- * Audio streaming through relay — works from anywhere on internet
+ * LabControl Pro — WebSocket Relay Server v2.0
+ * - Audio chunk relay (for listen/talk feature)
+ * - All message types properly forwarded
+ * - Self-ping to prevent Render.com sleep
+ * - Deploy on Render.com free tier
  */
 
 const WebSocket = require('ws');
 const http = require('http');
 
-const PORT           = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'labcontrol123';
+const SELF_URL = process.env.SELF_URL || ''; // e.g. https://hie-z3rp.onrender.com
 
+// ── HTTP server (health check + status) ──────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    service: 'LabControl Pro Relay',
-    status:  'online',
-    agents:  Object.keys(agents).length,
-    admins:  admins.size,
-    uptime:  Math.floor(process.uptime()),
-    time:    new Date().toISOString()
+    service: 'LabControl Pro Relay v2',
+    status: 'ok',
+    agents: Object.keys(agents).length,
+    admins: admins.size,
+    uptime: Math.round(process.uptime()),
+    audioSessions: audioSessions.size,
   }));
 });
 
-const wss    = new WebSocket.Server({ server, maxPayload: 50 * 1024 * 1024 });
-const agents = {};
-const admins = new Set();
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: 25 * 1024 * 1024  // 25MB for screenshots/audio
+});
 
-function safeSend(ws, data) {
+// ── State ─────────────────────────────────────────────────────────────────────
+const agents = {};      // agentId → { ws, info }
+const admins = new Set();
+const audioSessions = new Set(); // agentIds currently streaming audio
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function send(ws, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(typeof data === 'string' ? data : JSON.stringify(data)); } catch(e) {}
+    try { ws.send(JSON.stringify(data)); } catch (e) {}
   }
 }
-function broadcastAdmins(data) {
-  admins.forEach(ws => safeSend(ws, data));
+
+function broadcastToAdmins(data) {
+  const msg = JSON.stringify(data);
+  admins.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch (e) {}
+    }
+  });
 }
 
-// For audio: send to the admin who requested it, not all admins
-// Track which admin requested audio for which agent
-const audioSessions = {}; // agentId → admin ws
+function broadcastToAgents(data, targetIds = null) {
+  const msg = JSON.stringify(data);
+  const targets = targetIds
+    ? targetIds.filter(id => agents[id]).map(id => agents[id].ws)
+    : Object.values(agents).map(a => a.ws);
+  targets.forEach(ws => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch (e) {}
+    }
+  });
+}
 
+// ── Connection handler ────────────────────────────────────────────────────────
 wss.on('connection', (ws, req) => {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const remoteIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+    || req.socket.remoteAddress;
+
   ws.isAlive = true;
-  ws.role    = null;
+  ws.role = null;
   ws.agentId = null;
 
   ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('error', (e) => { console.error('WS error:', e.message); });
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(raw);
+    } catch (e) {
+      return; // ignore bad JSON
+    }
 
-    // ── AUTH ─────────────────────────────────────────────────────────────────
+    // ── AUTH ──────────────────────────────────────────────────────────────────
     if (msg.type === 'auth') {
       if (msg.role === 'admin') {
         if (msg.password !== ADMIN_PASSWORD) {
-          safeSend(ws, { type: 'auth_error', message: 'Wrong password' });
-          ws.close(1008, 'Auth failed');
+          send(ws, { type: 'auth_error', message: 'Wrong password' });
+          ws.close();
           return;
         }
         ws.role = 'admin';
         admins.add(ws);
-        safeSend(ws, { type: 'auth_ok', role: 'admin' });
-        safeSend(ws, { type: 'agent_list', agents: Object.values(agents).map(a => ({ ...a.info })) });
-        console.log(`[ADMIN] connected from ${ip} (${admins.size} total)`);
+        send(ws, { type: 'auth_ok', role: 'admin' });
+
+        // Send full agent list
+        const agentList = Object.values(agents).map(a => ({ ...a.info }));
+        send(ws, { type: 'agent_list', agents: agentList });
+        console.log(`[ADMIN] connected from ${remoteIp} (${admins.size} admins)`);
 
       } else if (msg.role === 'agent') {
-        const id  = msg.id || `agent_${Date.now()}`;
-        ws.role    = 'agent';
-        ws.agentId = id;
-        agents[id] = {
+        ws.role = 'agent';
+        ws.agentId = msg.id || msg.name || `agent_${Date.now()}`;
+
+        // Prevent duplicate IDs
+        if (agents[ws.agentId]) {
+          try { agents[ws.agentId].ws.terminate(); } catch (e) {}
+        }
+
+        agents[ws.agentId] = {
           ws,
           info: {
-            id, name: msg.name || id, user: msg.user || 'Unknown',
-            ip: msg.localIp || ip, os: msg.os || 'Unknown',
-            cpu: 0, ram: 0, status: 'online',
-            connectedAt: new Date().toISOString()
+            id: ws.agentId,
+            name: msg.name || ws.agentId,
+            user: msg.user || 'Unknown',
+            ip: msg.localIp || remoteIp,
+            os: msg.os || 'Unknown',
+            cpu: 0, ram: 0,
+            status: 'online',
+            connectedAt: new Date().toISOString(),
           }
         };
-        safeSend(ws, { type: 'auth_ok', id });
-        broadcastAdmins({ type: 'agent_connected', ...agents[id].info });
-        console.log(`[AGENT] ${id} connected from ${ip} — total: ${Object.keys(agents).length}`);
+
+        broadcastToAdmins({ type: 'agent_connected', ...agents[ws.agentId].info });
+        send(ws, { type: 'auth_ok', id: ws.agentId });
+        console.log(`[AGENT] ${ws.agentId} (${msg.name}) connected from ${remoteIp}`);
       }
       return;
     }
 
-    // ── PING/PONG ─────────────────────────────────────────────────────────────
-    if (msg.type === 'ping') { safeSend(ws, { type: 'pong', ts: Date.now() }); return; }
-    if (msg.type === 'pong') { return; }
-
-    // ── ADMIN → AGENT COMMANDS ────────────────────────────────────────────────
+    // ── ADMIN → AGENTS: forward commands ─────────────────────────────────────
     if (ws.role === 'admin' && msg.type === 'command') {
-      const targets = (msg.targets && msg.targets.length) ? msg.targets : Object.keys(agents);
+      const targetIds = msg.targets || Object.keys(agents);
       let delivered = 0;
-      targets.forEach(id => {
-        if (agents[id]) {
-          // Track audio session so we know which admin wants audio from which agent
-          if (msg.cmd === 'start_audio_stream') {
-            audioSessions[id] = ws;
-            console.log(`[AUDIO] session started: admin → agent ${id}`);
-          }
-          if (msg.cmd === 'stop_audio_stream') {
-            delete audioSessions[id];
-          }
-          safeSend(agents[id].ws, { type: 'command', ...msg });
+
+      targetIds.forEach(id => {
+        const agent = agents[id];
+        if (agent && agent.ws.readyState === WebSocket.OPEN) {
+          send(agent.ws, msg);
           delivered++;
         }
       });
-      safeSend(ws, { type: 'delivery_report', cmd: msg.cmd, delivered, total: targets.length });
-      console.log(`[CMD] ${msg.cmd} → ${delivered}/${targets.length}`);
-      return;
-    }
 
-    // ── ADMIN → AGENT WEBRTC SIGNALING ────────────────────────────────────────
-    if (ws.role === 'admin' && (msg.type === 'webrtc_answer' || msg.type === 'webrtc_ice')) {
-      const targets = msg.targets || [];
-      targets.forEach(id => {
-        if (agents[id]) safeSend(agents[id].ws, msg);
+      send(ws, {
+        type: 'delivery_report',
+        cmd: msg.cmd,
+        delivered,
+        total: targetIds.length
       });
       return;
     }
 
-    // ── AGENT → ADMIN MESSAGES ────────────────────────────────────────────────
+    // ── AGENT → ADMINS: forward all agent messages ────────────────────────────
     if (ws.role === 'agent') {
       const id = ws.agentId;
 
       switch (msg.type) {
+
+        // Screenshot frames
         case 'screenshot':
-          broadcastAdmins({ type: 'screenshot', id, data: msg.data });
+          broadcastToAdmins({ type: 'screenshot', id, data: msg.data });
           break;
 
+        // CPU/RAM stats
         case 'stats':
-          if (agents[id]) { agents[id].info.cpu = msg.cpu ?? 0; agents[id].info.ram = msg.ram ?? 0; }
-          broadcastAdmins({ type: 'stats_update', id, cpu: msg.cpu, ram: msg.ram });
-          break;
-
-        case 'cmd_result':
-          broadcastAdmins({ type: 'cmd_result', id, ...msg });
-          break;
-
-        case 'idle':
-          if (agents[id]) agents[id].info.status = msg.idle ? 'idle' : 'online';
-          broadcastAdmins({ type: 'idle_update', id, idle: msg.idle });
-          break;
-
-        case 'process_list':
-          broadcastAdmins({ type: 'process_list', id, list: msg.list });
-          break;
-
-        case 'sysinfo':
-          broadcastAdmins({ type: 'sysinfo', id, data: msg.data });
-          break;
-
-        case 'chat_reply':
-          broadcastAdmins({ type: 'chat_reply', id, from: msg.from, text: msg.text });
-          break;
-
-        // ── AUDIO — stream through relay so it works from anywhere ──────────
-        // Agent sends audio_chunk with base64 WAV data.
-        // Server forwards ONLY to the admin who requested audio for this agent.
-        // This avoids flooding all admins with audio data.
-        case 'audio_chunk': {
-          const adminWs = audioSessions[id];
-          if (adminWs && adminWs.readyState === WebSocket.OPEN) {
-            safeSend(adminWs, { type: 'audio_chunk', id, data: msg.data });
+          if (agents[id]) {
+            agents[id].info.cpu = msg.cpu || 0;
+            agents[id].info.ram = msg.ram || 0;
           }
+          broadcastToAdmins({ type: 'stats_update', id, cpu: msg.cpu, ram: msg.ram });
           break;
-        }
 
+        // Command result
+        case 'cmd_result':
+          broadcastToAdmins({ type: 'cmd_result', id, ...msg });
+          break;
+
+        // Idle state change
+        case 'idle':
+          if (agents[id]) {
+            agents[id].info.status = msg.idle ? 'idle' : 'online';
+          }
+          broadcastToAdmins({ type: 'idle_update', id, idle: msg.idle });
+          break;
+
+        // System info
+        case 'sysinfo':
+          broadcastToAdmins({ type: 'sysinfo', id, data: msg.data });
+          break;
+
+        // Process list
+        case 'process_list':
+          broadcastToAdmins({ type: 'process_list', id, list: msg.list });
+          break;
+
+        // Chat / message reply
+        case 'chat_reply':
+          broadcastToAdmins({ type: 'chat_reply', id, from: msg.from || agents[id]?.info?.name, text: msg.text });
+          break;
+
+        // ── AUDIO: stream PCM chunks from agent to admins ──────────────────
+        // This is the key feature: agent sends raw audio, server relays to dashboard
+        case 'audio_chunk':
+          audioSessions.add(id);
+          broadcastToAdmins({ type: 'audio_chunk', id, data: msg.data });
+          break;
+
+        // Audio metadata (sample rate, channels, etc.)
         case 'audio_info':
-          broadcastAdmins({ type: 'audio_info', id,
-            format: msg.format, channels: msg.channels, rate: msg.rate, mode: msg.mode });
+          broadcastToAdmins({ type: 'audio_info', id, ...msg });
           break;
 
-        case 'audio_stream_url':
-          broadcastAdmins({ type: 'audio_stream_url', id,
-            url: msg.url, ip: msg.ip, port: msg.port, mode: msg.mode });
-          break;
-
+        // Audio error
         case 'audio_error':
-          broadcastAdmins({ type: 'audio_error', id, error: msg.error });
+          audioSessions.delete(id);
+          broadcastToAdmins({ type: 'audio_error', id, error: msg.error });
           break;
 
-        // WebRTC signaling
-        case 'webrtc_offer':
-          broadcastAdmins({ type: 'webrtc_offer', id,
-            sdp: msg.sdp, sdp_type: msg.sdp_type, audio_mode: msg.audio_mode });
+        // Agent stopped audio stream
+        case 'audio_stopped':
+          audioSessions.delete(id);
+          broadcastToAdmins({ type: 'audio_stopped', id });
           break;
 
-        case 'webrtc_ice':
-          broadcastAdmins({ type: 'webrtc_ice', id, candidate: msg.candidate });
+        default:
+          // Forward any unknown message type to admins with agent id
+          broadcastToAdmins({ ...msg, id });
           break;
       }
+      return;
     }
   });
 
+  // ── Disconnect ────────────────────────────────────────────────────────────
   ws.on('close', () => {
     if (ws.role === 'admin') {
       admins.delete(ws);
-      // Clean up audio sessions for this admin
-      Object.keys(audioSessions).forEach(agentId => {
-        if (audioSessions[agentId] === ws) delete audioSessions[agentId];
-      });
+      console.log(`[ADMIN] disconnected (${admins.size} remain)`);
+
     } else if (ws.role === 'agent' && ws.agentId) {
+      audioSessions.delete(ws.agentId);
+      broadcastToAdmins({ type: 'agent_disconnected', id: ws.agentId });
       delete agents[ws.agentId];
-      delete audioSessions[ws.agentId];
-      broadcastAdmins({ type: 'agent_disconnected', id: ws.agentId });
-      console.log(`[AGENT] ${ws.agentId} disconnected — total: ${Object.keys(agents).length}`);
+      console.log(`[AGENT] ${ws.agentId} disconnected`);
     }
   });
-
-  ws.on('error', () => {});
 });
 
-// Heartbeat
+// ── Heartbeat: kill dead connections every 30s ────────────────────────────────
 const heartbeat = setInterval(() => {
   wss.clients.forEach(ws => {
-    if (!ws.isAlive) { ws.terminate(); return; }
+    if (!ws.isAlive) {
+      ws.terminate();
+      return;
+    }
     ws.isAlive = false;
     ws.ping();
   });
-}, 30_000);
+}, 30000);
+
 wss.on('close', () => clearInterval(heartbeat));
 
-// Self-ping to prevent Render sleep
-if (process.env.SELF_URL) {
+// ── Self-ping to prevent Render.com free tier sleep ───────────────────────────
+if (SELF_URL) {
+  const https = require('https');
+  const urlMod = require('url');
   setInterval(() => {
-    const url = process.env.SELF_URL;
-    const mod = url.startsWith('https') ? require('https') : require('http');
-    mod.get(url, res => {
-      console.log(`[KEEPALIVE] ping → ${res.statusCode}`);
-    }).on('error', () => {});
-  }, 10 * 60 * 1000);
+    try {
+      const parsed = urlMod.parse(SELF_URL);
+      const lib = parsed.protocol === 'https:' ? https : require('http');
+      lib.get(SELF_URL, res => {
+        console.log(`[PING] Self-ping ${res.statusCode}`);
+      }).on('error', () => {});
+    } catch (e) {}
+  }, 10 * 60 * 1000); // every 10 minutes
+  console.log(`[PING] Self-ping enabled → ${SELF_URL}`);
 }
 
+// ── Start ─────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`LabControl Pro Relay v2.0 on port ${PORT}`);
-  console.log(`Password: ${ADMIN_PASSWORD.slice(0,2)}****`);
+  console.log(`LabControl Pro Relay v2 running on port ${PORT}`);
+  console.log(`Password: ${ADMIN_PASSWORD}`);
+  console.log(`Max payload: 25MB`);
 });
